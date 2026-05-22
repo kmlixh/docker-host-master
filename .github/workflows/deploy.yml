@@ -84,9 +84,25 @@ jobs:
           OLD_NAME="${CONTAINER_NAME}-old-${GITHUB_RUN_ID}"
           PORTAINER_BASE="${PORTAINER_URL}/endpoints/${ENDPOINT_ID}/docker"
 
-          # Redis 默认走 janyee_net docker DNS (redis:6379)
-          REDIS_ADDR="${{ vars.REDIS_ADDR }}"
-          [ -z "$REDIS_ADDR" ] && REDIS_ADDR="redis:6379"
+          # REDIS_ADDR 必须显式配置 — 故意不给默认值。
+          #
+          # 优先级:secrets.REDIS_ADDR (运维觉得地址敏感就配 secret) →
+          #         vars.REDIS_ADDR (普通配置)
+          # 都没填就 fail fast。
+          #
+          # 严禁默认 fallback 到 "redis:6379" 这种主机名:
+          # docker-host-master 容器内 /etc/hosts 从宿主 bind mount 来,而本服务自己又
+          # 在这个 /etc/hosts 写 managed 块。一旦宿主上有任何容器叫 "redis"(test/cache/
+          # 之类),"redis" 就解析到那个容器,静默连错 Redis,排查地狱。
+          # → 强制要求 IP 字面量(例: 172.17.0.1:6379),绕过解析。
+          REDIS_ADDR="${{ secrets.REDIS_ADDR }}"
+          [ -z "$REDIS_ADDR" ] && REDIS_ADDR="${{ vars.REDIS_ADDR }}"
+          if [ -z "$REDIS_ADDR" ]; then
+            echo "ERROR: REDIS_ADDR 未配置 (secrets 和 vars 里都没找到)"
+            echo "  没默认值 — 必须显式填,强烈建议 IP 字面量 (例: 172.17.0.1:6379)"
+            echo "  避免主机名解析撞 docker-host-master 自维护的 /etc/hosts entries"
+            exit 1
+          fi
           REDIS_DB="${{ vars.REDIS_DB }}"
           [ -z "$REDIS_DB" ] && REDIS_DB="3"
 

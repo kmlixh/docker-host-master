@@ -75,8 +75,12 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 | `PORTAINER_URL` | Portainer API 地址 | `https://portainer.example.com/api` |
 | **`PORTAINER_ENDPOINT_ID`** | **默认 endpoint id**(单值,跟 adminBackend 一致) | `1` |
 | `CONTAINER_NAME` | 容器名(可选,默认 `docker-host-master`) | `docker-host-master` |
-| `REDIS_ADDR` | Redis 地址(可选,默认 `redis:6379` 走 docker DNS) | `redis:6379` |
+| **`REDIS_ADDR`** | **必填,无默认**。**强烈建议 IP 字面量** — 别用主机名 (见下方 ⚠️)。也可改放 secrets,二选一 | `172.17.0.1:6379` |
 | `REDIS_DB` | Redis DB(可选,默认 `3`,对齐 adminBackend.authing.redis.database) | `3` |
+
+> ⚠️ **REDIS_ADDR 不要用主机名(例如 `redis:6379`)**:docker-host-master 容器内的 /etc/hosts 是从宿主 bind mount 进来的,而本服务自己又往这个 /etc/hosts 写 managed 块。如果宿主上凑巧有任何容器叫 `redis`(测试容器/cache/...),`redis` 就会解析到那个容器,**静默连错 Redis**,排查地狱。IP 字面量绕过所有解析,稳。
+
+> 💡 **REDIS_ADDR 放 var 还是 secret?** workflow 两边都查 — **secrets 优先,vars fallback**。如果你觉得 Redis 地址敏感(暴露内网拓扑),放 secret;否则放 var(便于 Actions log 里查问题时直接可见)。二选一,别两边都配避免歧义。
 
 #### GitHub repo secrets
 
@@ -87,6 +91,7 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 | `X_REGISTRY_AUTH` | Portainer 拉镜像用的 base64 编码 registry auth |
 | `COSIGN_PASSWORD` / `COSIGN_PRIVATE_KEY` | cosign 签名 |
 | `REDIS_PASSWORD` | Redis 密码 |
+| `REDIS_ADDR` (可选) | Redis 地址 — 跟 `vars.REDIS_ADDR` 二选一,secrets 优先 |
 
 #### 容器创建参数(写死在 workflow 里)
 
@@ -112,12 +117,14 @@ docker run -d --name docker-host-master \
   -v docker-host-master-data:/var/lib/docker-host-master \
   --cap-add DAC_OVERRIDE \
   -p 8090:8090 \
-  -e REDIS_ADDR=redis:6379 \
+  -e REDIS_ADDR=172.17.0.1:6379 \
   -e REDIS_PASSWORD='your-redis-password' \
   -e REDIS_DB=3 \
   --restart unless-stopped \
   harbor.url/docker-host-master:vXXXX
 ```
+
+> ⚠️ `REDIS_ADDR` **不要写 `redis:6379` 这种主机名** — 容器内 /etc/hosts 是本服务自维护的,撞名会静默连错。用 IP 字面量(`172.17.0.1` = 宿主 docker0 gateway,Redis 监听宿主上时通用)。
 
 **关键 mount 讲清楚**:
 
@@ -135,13 +142,15 @@ docker run -d --name docker-host-master \
 
 ### REDIS_ADDR 怎么填?
 
-| Redis 部署位置 | 该填什么 |
-|---|---|
-| Redis 是 janyee_net 上的容器,名字 `redis` | `redis:6379`(走 docker DNS,**推荐**) |
-| Redis 跑在宿主上(非容器) | `host.docker.internal:6379`(macOS/Win 默认通,Linux 加 `--add-host host.docker.internal:host-gateway`) |
-| Redis 在另一台机器 | `<那台机器的 IP>:6379` |
+**核心原则:用 IP 字面量,别用主机名**(主机名解析撞 /etc/hosts 自维护块的坑见上面 ⚠️)。
 
-原 README 里写 `172.17.0.1:6379` 是 docker0 bridge gateway,只在容器跑在**默认 bridge** 网络时才管用。一旦你 `--network janyee_net`,容器看不到 docker0,这个地址就不通了 — 必须改成上表里对应方案。
+| Redis 部署位置 | 推荐填法 | 备注 |
+|---|---|---|
+| **Redis 监听在宿主上**(docker container 或 native) | `172.17.0.1:6379` | 宿主 docker0 gateway IP。从 janyee_net 容器内也能联通(实测可达,无需 `host.docker.internal`)。最常见的生产配置 |
+| Redis 是 janyee_net 上的容器 | `<那个容器的固定 IPAM IP>:6379` 或者 `<container-name>.janyee_net:6379` | 容器名直连会撞 /etc/hosts (见 ⚠️),如果非要用主机名,带网络后缀 `.janyee_net` 让 docker 内嵌 DNS 优先解析 |
+| Redis 在另一台机器 | `<那台机器的 IP>:6379` | 跨机直连 |
+
+**不要再用 `redis:6379`** — 这个写法之前我加默认值是错的(已在 deploy.yml 里强制要求非空 + 拒绝默认 fallback),新部署必须显式填一个具体地址。
 
 ### audit log 怎么办?
 
