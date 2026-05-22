@@ -22,6 +22,7 @@ var (
 	dockerCli  *DockerClient
 	hostsMgr   *HostsManager
 	hostDaemon *Daemon
+	tokenStore *TokenStore
 )
 
 func main() {
@@ -81,8 +82,18 @@ func main() {
 		log.Println("daemon stopped")
 	}()
 
-	// 4. TODO Phase C: 初始化数据库 + AccessToken store
-	// 4. TODO Phase C/D: 初始化 authing JWT validator
+	// 4. Token store (Phase C) — 失败致命(没 DB 外部 API 全废,admin token CRUD 也废)
+	tokenStore, err = NewTokenStore(cfg)
+	if err != nil {
+		log.Printf("WARN: token store init failed: %v (/admin/tokens + /external/* 路由会 503)", err)
+	}
+
+	// 5. Authing JWT validator (Phase C) — 失败 warn,/admin/* 路由会拒绝所有请求
+	InitAuthing(cfg)
+
+	// 6. Audit log (Phase D)
+	InitAuditLog(cfg)
+	defer CloseAuditLog()
 
 	// 5. Fiber HTTP server
 	app := fiber.New(fiber.Config{
