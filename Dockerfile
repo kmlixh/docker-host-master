@@ -1,5 +1,7 @@
 # Build stage
-FROM golang:1.23-alpine AS builder
+# 注意:go.mod 要求 go >= 1.26.1,这里 float 到最新 1.26.x patch (golang:1.26-alpine),
+# 自动跟进 patch 安全更新但不主版本漂移。
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
