@@ -17,7 +17,12 @@ import (
 
 // 全局应用配置(consul 加载后填),给各 handler/middleware 用。
 // daemon goroutine 也读它(docker endpoint / hosts file path)
-var appCfg *Config
+var (
+	appCfg     *Config
+	dockerCli  *DockerClient
+	hostsMgr   *HostsManager
+	hostDaemon *Daemon
+)
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -47,7 +52,35 @@ func main() {
 	appCfg = cfg
 	log.Printf("app config loaded: docker=%s hosts=%s", cfg.Docker.Endpoint, cfg.Hosts.File)
 
-	// 4. TODO Phase B: 初始化 Docker client + /etc/hosts manager + 启动 daemon goroutine
+	// 4. Docker client + /etc/hosts manager + daemon (Phase B)
+	dockerCli, err = NewDockerClient(cfg.Docker.Endpoint, cfg.Docker.TimeoutSeconds)
+	if err != nil {
+		log.Fatalf("docker client: %v", err)
+	}
+	defer dockerCli.Close()
+
+	// 验 docker daemon 可达(不行不致命,只 log)
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if ver, perr := dockerCli.Ping(pingCtx); perr != nil {
+		log.Printf("WARN: docker daemon ping failed: %v (daemon goroutine 仍会启动,会自动重试)", perr)
+	} else {
+		log.Printf("docker daemon OK: api=%s", ver)
+	}
+	pingCancel()
+
+	hostsMgr = NewHostsManager(cfg.Hosts.File, cfg.Hosts.BeginMarker, cfg.Hosts.EndMarker)
+
+	// 起 daemon goroutine — 事件循环 + 定期 reconcile
+	daemonCtx, daemonCancel := context.WithCancel(context.Background())
+	hostDaemon = NewDaemon(dockerCli, hostsMgr, cfg)
+	hostDaemon.Start(daemonCtx)
+	defer func() {
+		log.Println("stopping daemon...")
+		daemonCancel()
+		hostDaemon.Wait()
+		log.Println("daemon stopped")
+	}()
+
 	// 4. TODO Phase C: 初始化数据库 + AccessToken store
 	// 4. TODO Phase C/D: 初始化 authing JWT validator
 
