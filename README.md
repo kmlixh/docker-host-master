@@ -43,11 +43,13 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 每台主机一次 `docker run`,无前置 DB 初始化:
 
 ```bash
+# 一次性建 named volume (docker 自己管,不污染宿主文件系统)
+docker volume create docker-host-master-data
+
 docker run -d --name docker-host-master \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
   -v /etc/hosts:/etc/hosts:rw \
-  -v /var/lib/docker-host-master:/var/lib/docker-host-master:rw \
-  -v /var/log/docker-host-master:/var/log/docker-host-master:rw \
+  -v docker-host-master-data:/var/lib/docker-host-master \
   --cap-add DAC_OVERRIDE \
   -p 8090:8090 \
   -e REDIS_ADDR=172.17.0.1:6379 \
@@ -57,11 +59,27 @@ docker run -d --name docker-host-master \
   harbor.url/docker-host-master:vXXXX
 ```
 
-**关键 mount**:
-- `/var/run/docker.sock` → 容器内能调宿主 docker daemon
-- `/etc/hosts` → 自动维护宿主 hosts
-- `/var/lib/docker-host-master` → access_token JSON 文件持久化(重启不丢)
-- `--cap-add DAC_OVERRIDE` → 写 /etc/hosts(避免 `--privileged`)
+**关键 mount 讲清楚**:
+
+| mount | 类型 | 为啥 |
+|---|---|---|
+| `/var/run/docker.sock` | host bind | 容器内调宿主 docker daemon,必须 bind |
+| `/etc/hosts` | host bind | 自动维护宿主 hosts 这是核心功能,必须 bind |
+| `docker-host-master-data` | **named volume** | access_token JSON 文件持久化。**不用 bind mount** — 这是服务内部状态,不应该出现在宿主目录里 |
+| `--cap-add DAC_OVERRIDE` | cap | 写 /etc/hosts 需要(避免 `--privileged`) |
+
+> **不要**用 `-v /var/lib/docker-host-master:/var/lib/docker-host-master`。bind mount 等于把服务的内部状态(包含 bcrypt 哈希的 token 文件)暴露到宿主目录,admin SSH 上去能 ls 到,reduce attack surface 反向操作。named volume 由 docker 管,落在 `/var/lib/docker/volumes/docker-host-master-data/_data/` 但运维通常不直接进去。
+
+### audit log 怎么办?
+
+默认在容器内的 `/var/log/docker-host-master/audit.log`,容器删了就丢。同时**也写 stdout**,
+所以 `docker logs docker-host-master` 永远拿得到一份。需要 file 长期保留就加另一个 named volume:
+
+```bash
+-v docker-host-master-logs:/var/log/docker-host-master
+```
+
+或者直接接 ops 现有的 docker logs 收集链路(filebeat / fluent-bit / loki) — **推荐这条**,跟其他服务统一日志栈。
 
 ## 验证
 
@@ -96,8 +114,28 @@ curl -H "X-Access-Token: <plain>" -X POST \
 
 ## 数据存哪
 
-- `/var/lib/docker-host-master/tokens.json` — access_token bcrypt 哈希
-- `/var/log/docker-host-master/audit.log` — external 调用一行一记
-- `/etc/hosts` 的 `# BEGIN docker-host-master` 到 `# END` 之间 — managed 块
+| 数据 | 存哪 | 是否暴露宿主 |
+|---|---|---|
+| access_token (bcrypt 哈希) | named volume `docker-host-master-data` → 容器内 `/var/lib/docker-host-master/tokens.json` | ❌ 仅 docker 管 |
+| 审计 log | 容器内 `/var/log/docker-host-master/audit.log` + stdout(docker logs)| 默认不;按需可加 volume |
+| /etc/hosts managed 条目 | 宿主 `/etc/hosts` (`# BEGIN docker-host-master` 块)| ✅ 这是核心功能 |
 
-`tokens.json` 备份就是 `cp` 一下,恢复 `cp` 回去,无 DB 复杂性。
+### 备份 / 恢复 tokens
+
+```bash
+# 备份
+docker run --rm \
+  -v docker-host-master-data:/data:ro \
+  -v "$PWD":/backup \
+  alpine cp /data/tokens.json /backup/tokens-$(date +%F).json
+
+# 恢复
+docker stop docker-host-master
+docker run --rm \
+  -v docker-host-master-data:/data \
+  -v "$PWD":/backup \
+  alpine cp /backup/tokens-2026-05-22.json /data/tokens.json
+docker start docker-host-master
+```
+
+或者直接 `docker volume inspect docker-host-master-data` 找到底层路径手动 cp(运维场景不推荐,因为版本/路径可能变)。
