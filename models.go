@@ -14,7 +14,8 @@ import "time"
 // hostname:空 = 全集群通用;非空 = 只在该 host 启用(每实例只看自己 hostname 的)
 type AccessToken struct {
 	ID          uint       `json:"id"`
-	TokenHash   string     `json:"token_hash"` // bcrypt hash,JSON 文件里也是哈希,不是 plain
+	TokenHash   string     `json:"token_hash"`              // bcrypt hash,plain 永远不入库
+	TokenPrefix string     `json:"token_prefix,omitempty"`  // plain 的前 8 字符,UI 列表用来区分 token,非敏感
 	Name        string     `json:"name"`
 	Description string     `json:"description,omitempty"`
 	Hostname    string     `json:"hostname,omitempty"`
@@ -23,4 +24,17 @@ type AccessToken struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+}
+
+// TokenPrefixLen 是 UI 列表展示用的"头部"字符数。
+// 8 字符 → ~48 bit 熵,远不够暴力 → 不构成泄露风险(bcrypt full hash 也不能从这反推出 plain)。
+// 长度跟 GitHub PAT 显示模式接近。
+const TokenPrefixLen = 8
+
+// makeTokenPrefix 从 plain 摘头部
+func makeTokenPrefix(plain string) string {
+	if len(plain) <= TokenPrefixLen {
+		return plain
+	}
+	return plain[:TokenPrefixLen]
 }

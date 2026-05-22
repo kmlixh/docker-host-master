@@ -148,6 +148,7 @@ func (s *TokenStore) Create(name, description, hostname string, expiresAt *time.
 	row := &AccessToken{
 		ID:          s.nextID,
 		TokenHash:   string(hash),
+		TokenPrefix: makeTokenPrefix(plain),
 		Name:        name,
 		Description: description,
 		Hostname:    hostname,
@@ -186,11 +187,14 @@ func (s *TokenStore) Regenerate(id uint) (string, error) {
 		return "", errors.New("token not found")
 	}
 	oldHash := t.TokenHash
+	oldPrefix := t.TokenPrefix
 	t.TokenHash = string(hash)
+	t.TokenPrefix = makeTokenPrefix(plain)
 	t.UpdatedAt = time.Now()
 
 	if err := s.dump(); err != nil {
 		t.TokenHash = oldHash
+		t.TokenPrefix = oldPrefix
 		return "", fmt.Errorf("persist: %w", err)
 	}
 	return plain, nil

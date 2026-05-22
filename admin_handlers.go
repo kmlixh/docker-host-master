@@ -159,20 +159,21 @@ func adminCreateToken(c *fiber.Ctx) error {
 	return c.Status(201).JSON(fiber.Map{
 		"code": 0,
 		"data": fiber.Map{
-			"id":          row.ID,
-			"name":        row.Name,
-			"description": row.Description,
-			"hostname":    row.Hostname,
-			"enabled":     row.Enabled,
-			"expires_at":  row.ExpiresAt,
-			"created_at":  row.CreatedAt,
-			"token":       plain, // ⚠ 只这次返回,客户端必须保存好
+			"id":           row.ID,
+			"name":         row.Name,
+			"description":  row.Description,
+			"hostname":     row.Hostname,
+			"enabled":      row.Enabled,
+			"expires_at":   row.ExpiresAt,
+			"created_at":   row.CreatedAt,
+			"token_prefix": row.TokenPrefix, // 头部,后续列表里也看得到
+			"token":        plain,           // ⚠ 只这次返回,客户端必须保存好
 		},
 		"msg": "access token created — token plaintext is shown only once",
 	})
 }
 
-// GET /admin/tokens — 列出所有 token (无 plain)
+// GET /admin/tokens — 列出所有 token (无 plain,无 bcrypt hash)
 func adminListTokens(c *fiber.Ctx) error {
 	if tokenStore == nil {
 		return c.Status(503).JSON(fiber.Map{"code": 503, "msg": "token store not initialized"})
@@ -181,7 +182,25 @@ func adminListTokens(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"code": 500, "msg": err.Error()})
 	}
-	return c.JSON(fiber.Map{"code": 0, "data": rows})
+	// 显式过滤 token_hash,只输出 UI 需要的字段。
+	// bcrypt hash 暴露虽然不能反推 plain,但没必要往外吐(reduce attack surface)。
+	view := make([]fiber.Map, 0, len(rows))
+	for _, r := range rows {
+		view = append(view, fiber.Map{
+			"id":           r.ID,
+			"name":         r.Name,
+			"description":  r.Description,
+			"hostname":     r.Hostname,
+			"enabled":      r.Enabled,
+			"expires_at":   r.ExpiresAt,
+			"created_at":   r.CreatedAt,
+			"updated_at":   r.UpdatedAt,
+			"last_used_at": r.LastUsedAt,
+			"token_prefix": r.TokenPrefix, // 头部,用来在列表里识别哪个 token
+			// 故意不带 token_hash
+		})
+	}
+	return c.JSON(fiber.Map{"code": 0, "data": view})
 }
 
 // POST /admin/tokens/:id/regenerate — 重生 plain,老的立刻失效
@@ -196,8 +215,12 @@ func adminRegenerateToken(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{
 		"code": 0,
-		"data": fiber.Map{"id": id, "token": plain},
-		"msg":  "regenerated — old token immediately invalid",
+		"data": fiber.Map{
+			"id":           id,
+			"token":        plain,
+			"token_prefix": makeTokenPrefix(plain),
+		},
+		"msg": "regenerated — old token immediately invalid",
 	})
 }
 
