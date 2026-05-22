@@ -27,16 +27,18 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 | `DOCKER_ENDPOINT` | `unix:///var/run/docker.sock` | docker daemon 连接 |
 | `DOCKER_TIMEOUT_SEC` | 30 | docker API 调用超时 |
 | `HOSTS_FILE` | `/etc/hosts` | 容器内 bind mount 进来的宿主 hosts |
-| `HOSTS_BEGIN_MARKER` | `# BEGIN docker-host-master (DO NOT EDIT)` | managed 块起始 |
-| `HOSTS_END_MARKER` | `# END docker-host-master` | managed 块结束 |
-| `HOSTS_RECONCILE_INTERVAL_SEC` | 300 | 5min 全量同步兜底 |
 | **`REDIS_ADDR`** | (空) | **必填** — 共享 Redis 地址 (例 `172.17.0.1:6379`)。空 → /admin/* 全 503 |
 | `REDIS_PASSWORD` | (空) | |
 | `REDIS_DB` | 3 | **必须跟 adminBackend.authing.redis.database 对齐** |
-| `TOKEN_STORE_FILE` | `/var/lib/docker-host-master/tokens.json` | 本地 JSON 文件 |
-| `AUDIT_LOG` | `/var/log/docker-host-master/audit.log` | external 调用审计 |
 
 启动 log 会 warn 缺什么必填 + 对应路由会怎么 503。
+
+### 硬编码,不开 env(运维无需也无理由改)
+
+- `/etc/hosts` managed 块的 BEGIN/END marker — 写死成 `# BEGIN docker-host-master (DO NOT EDIT)` / `# END docker-host-master`。两个 marker 必须配对,把 env 暴露出来反而容易因运维改一个忘改另一个而导致 hosts 全文乱掉
+- HOSTS 全量 reconcile 间隔 — 5 分钟(`300s`)。这是事件丢失的兜底机制,不需要让外面改
+- access_token JSON 文件路径 — `/var/lib/docker-host-master/tokens.json`,跟 Dockerfile 里的 named volume mount path 强绑定。改了 → 写到容器内非 mount 目录 → 容器删了 token 全丢
+- audit log 路径 — `/var/log/docker-host-master/audit.log`,同时写 stdout(`docker logs` 永远拿得到)。需要长期保留 file 就再挂个 named volume(见下文 audit log 章节),不通过 env 改路径
 
 ## 部署
 

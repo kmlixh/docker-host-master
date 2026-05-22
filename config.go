@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 )
@@ -17,6 +16,20 @@ import (
 //   REDIS_ADDR     — admin token 验证靠这个,空了 /admin/* 全部 503
 //
 // (注:adminBackend / userLogin 的 admin 是写 Redis db=3,这里 REDIS_DB 必须对齐 = 3)
+//
+// 以下是硬编码默认,不开 env vars(运维无理由改,只会引入版本不一致 bug):
+//   - HOSTS 块的 BEGIN/END marker(必须配对,可读性强)
+//   - HOSTS 全量 reconcile 间隔 5min(够兜底丢事件)
+//   - TOKEN_STORE 文件路径(named volume 内固定位置)
+//   - AUDIT_LOG 路径(named volume + stdout 双写,运维如果要 file 长期保留就再挂一个 volume)
+const (
+	defaultHostsBeginMarker          = "# BEGIN docker-host-master (DO NOT EDIT)"
+	defaultHostsEndMarker            = "# END docker-host-master"
+	defaultHostsReconcileIntervalSec = 300
+	defaultTokenStoreFile            = "/var/lib/docker-host-master/tokens.json"
+	defaultAuditLogFile              = "/var/log/docker-host-master/audit.log"
+)
+
 type Config struct {
 	Server struct {
 		Port int
@@ -30,9 +43,9 @@ type Config struct {
 
 	Hosts struct {
 		File                 string
-		BeginMarker          string
-		EndMarker            string
-		ReconcileIntervalSec int
+		BeginMarker          string // 硬编码默认,见 defaultHostsBeginMarker
+		EndMarker            string // 硬编码默认,见 defaultHostsEndMarker
+		ReconcileIntervalSec int    // 硬编码默认 300s
 	}
 
 	// Redis — 跟 adminBackend.authing.redis 对齐,共享 admin token store
@@ -43,12 +56,13 @@ type Config struct {
 	}
 
 	// 本地 token store(JSON 文件)— /external/* 的 access_token 存这
+	// 路径硬编码,运维不要改 — 跟 Dockerfile / docker run 的 named volume mount path 强绑定
 	TokenStore struct {
-		File string // 默认 /var/lib/docker-host-master/tokens.json
+		File string
 	}
 
 	Audit struct {
-		LogFile string
+		LogFile string // 硬编码,运维只能通过加 named volume 把整个目录挂出来
 	}
 }
 
@@ -61,18 +75,18 @@ func LoadFromEnv() *Config {
 	c.Docker.Endpoint = envStr("DOCKER_ENDPOINT", "unix:///var/run/docker.sock")
 	c.Docker.TimeoutSeconds = envInt("DOCKER_TIMEOUT_SEC", 30)
 
+	// HOSTS 文件路径还是允许覆盖(测试环境/特殊 mount 用),但 marker + 兜底间隔写死
 	c.Hosts.File = envStr("HOSTS_FILE", "/etc/hosts")
-	c.Hosts.BeginMarker = envStr("HOSTS_BEGIN_MARKER", "# BEGIN docker-host-master (DO NOT EDIT)")
-	c.Hosts.EndMarker = envStr("HOSTS_END_MARKER", "# END docker-host-master")
-	c.Hosts.ReconcileIntervalSec = envInt("HOSTS_RECONCILE_INTERVAL_SEC", 300)
+	c.Hosts.BeginMarker = defaultHostsBeginMarker
+	c.Hosts.EndMarker = defaultHostsEndMarker
+	c.Hosts.ReconcileIntervalSec = defaultHostsReconcileIntervalSec
 
 	c.Redis.Addr = envStr("REDIS_ADDR", "") // 必填
 	c.Redis.Password = envStr("REDIS_PASSWORD", "")
 	c.Redis.DB = envInt("REDIS_DB", 3) // 默认 3 跟 adminBackend.authing.redis.database 对齐
 
-	c.TokenStore.File = envStr("TOKEN_STORE_FILE", "/var/lib/docker-host-master/tokens.json")
-
-	c.Audit.LogFile = envStr("AUDIT_LOG", "/var/log/docker-host-master/audit.log")
+	c.TokenStore.File = defaultTokenStoreFile
+	c.Audit.LogFile = defaultAuditLogFile
 
 	return c
 }
@@ -101,6 +115,3 @@ func envInt(key string, def int) int {
 	}
 	return def
 }
-
-// 占位,避免 import "fmt" 被 tidy 删
-var _ = fmt.Sprintf
