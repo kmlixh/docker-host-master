@@ -47,26 +47,38 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 
 ### 方式一:GitHub Actions + Portainer(推荐,生产用)
 
-`.github/workflows/deploy.yml` 在 push tag 时:
+跟 adminBackend 同款 — 单 job + 单 endpoint 部署。tag push 时:
 1. build + push image 到 Harbor
 2. cosign 签名
-3. 对 `PORTAINER_ENDPOINT_IDS` 列表里**每个 endpoint**(每个 endpoint 对应一台 host)循环执行:
-   pull → 备份老容器 → create+start 新容器 → 健康检查 → 失败 per-endpoint rollback
-4. 单个 host 失败不阻塞其它 host;最终任一失败 → job FAILED
+3. Portainer 替换容器:pull → 备份老容器 → create+start 新容器 → 健康检查 → 失败自动 rollback
 
-**GitHub repo vars(非 secret):**
+#### tag → 服务器派发约定
+
+| tag 写法 | 部署到 |
+|---|---|
+| `v260522172933` | **默认** endpoint = `vars.PORTAINER_ENDPOINT_ID` |
+| `v260522172933@2` | endpoint id = `2`(覆盖默认) |
+| `v260522172933@5` | endpoint id = `5` |
+
+逻辑:tag 后缀 `@<数字>` 命中就用这个 endpoint id,否则用默认 var。
+
+**用法:** 想发到 host A 就 `git tag vXXX && git push --tags`;想发到 host B(假设 endpoint id 是 3)就 `git tag vXXX@3 && git push --tags`。workflow 不动,加机器只是多打个 tag。
+
+(暂时只用一台 host,所以 `vars.PORTAINER_ENDPOINT_ID` 配一个 id 就够。未来要全量并发,把单 job 改成 matrix。)
+
+#### GitHub repo vars(非 secret)
 
 | var | 说明 | 示例 |
 |---|---|---|
 | `HARBOR_URL` | Harbor registry 地址 | `harbor.example.com` |
 | `IMAGE_NAME` | image 名 | `docker-host-master` |
 | `PORTAINER_URL` | Portainer API 地址 | `https://portainer.example.com/api` |
-| **`PORTAINER_ENDPOINT_IDS`** | **逗号分隔的 endpoint id 列表 — 每个对应一台 host** | `1,2,3` |
+| **`PORTAINER_ENDPOINT_ID`** | **默认 endpoint id**(单值,跟 adminBackend 一致) | `1` |
 | `CONTAINER_NAME` | 容器名(可选,默认 `docker-host-master`) | `docker-host-master` |
-| `REDIS_ADDR` | Redis 地址(走 docker DNS) | `redis:6379` |
-| `REDIS_DB` | Redis DB(默认 3,对齐 adminBackend.authing.redis.database) | `3` |
+| `REDIS_ADDR` | Redis 地址(可选,默认 `redis:6379` 走 docker DNS) | `redis:6379` |
+| `REDIS_DB` | Redis DB(可选,默认 `3`,对齐 adminBackend.authing.redis.database) | `3` |
 
-**GitHub repo secrets:**
+#### GitHub repo secrets
 
 | secret | 说明 |
 |---|---|
@@ -76,14 +88,12 @@ host-level Docker 容器管理 + 自动 `/etc/hosts` 维护 + 外部 access_toke
 | `COSIGN_PASSWORD` / `COSIGN_PRIVATE_KEY` | cosign 签名 |
 | `REDIS_PASSWORD` | Redis 密码 |
 
-**Portainer 容器创建参数**(写死在 workflow 里,你不用改,但要知道在做什么):
+#### 容器创建参数(写死在 workflow 里)
 
 - `NetworkMode: janyee_net` + `EndpointsConfig: { janyee_net: {} }` — **只指定网络,不指定 IP**,docker IPAM 自动分配
 - `Binds: [docker.sock, /etc/hosts, docker-host-master-data:/var/lib/docker-host-master]` — sock + hosts bind mount,内部状态走 named volume
 - `CapAdd: ["DAC_OVERRIDE"]` — 写 /etc/hosts 需要
 - `PortBindings: 8090:8090` + `RestartPolicy: unless-stopped`
-
-加 / 摘 host:改 `PORTAINER_ENDPOINT_IDS` 这个 var,下一次 tag push 自动生效。
 
 ### 方式二:手动 `docker run`(首次 bootstrap / 本地测试)
 
