@@ -1,8 +1,19 @@
-name: Build and Push on Tag
+name: Build, Push and Deploy on Tag
 
-# docker-host-master 每台主机一个实例,GitHub Actions 只负责构建+推 Harbor。
-# 实际部署每台 host 自己跑(README 里给 docker run 命令)。
-# 后续如果接 Portainer per-host endpoint,可以加分支按 hostname 派发。
+# docker-host-master 每台主机一个实例。
+#
+# GitHub vars 里 PORTAINER_ENDPOINT_IDS 配成逗号分隔的 endpoint id 列表
+# (e.g. "1,2,3"),workflow 逐个 endpoint 部署 — 一次 tag push 把所有
+# host 上的 docker-host-master 全部 redeploy。
+#
+# 关键点:
+# - 只指定 --network janyee_net,绝不指定 --ip(IPAM 自动分配,避免撞地址)
+# - 必须 mount 宿主 /var/run/docker.sock + /etc/hosts (核心功能)
+# - 内部状态走 named volume docker-host-master-data (不暴露给宿主)
+# - 加 CAP_DAC_OVERRIDE 才能写 /etc/hosts (避免 --privileged)
+#
+# 多 endpoint 失败语义:某 host 失败 → 该 host 自己 rollback,其它 host
+# 继续 deploy,最终汇总;只要有任一 host 失败,job 标记为 failed。
 
 on:
   push:
@@ -12,6 +23,8 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-image.outputs.image_tag }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -26,11 +39,13 @@ jobs:
         run: echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ vars.HARBOR_URL }} -u "${{ secrets.HARBOR_USERNAME }}" --password-stdin
 
       - name: Build and Push Docker Image
+        id: set-image
         run: |
           IMAGE_TAG="${{ vars.HARBOR_URL }}/${{ vars.IMAGE_NAME }}:${{ github.ref_name }}"
           echo "Building $IMAGE_TAG"
           docker build -t "$IMAGE_TAG" .
           docker push "$IMAGE_TAG"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Sign Container Image
         env:
@@ -42,3 +57,233 @@ jobs:
           chmod 600 cosign.key
           cosign sign --key cosign.key "$IMAGE_TAG"
           rm -f cosign.key
+
+  deploy-per-host:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Replace Container on every Portainer endpoint
+        # 对 PORTAINER_ENDPOINT_IDS 列表里的每个 endpoint 都执行
+        # pull → 备份老 → create+start 新 → health check → 失败 per-endpoint rollback。
+        # 单个 endpoint 失败不阻塞其它 endpoint;最后只要有一个失败,exit 1。
+        run: |
+          set -uo pipefail
+
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          IMAGE_NAME_ENC=$(jq -rn --arg v "$IMAGE_TAG" '@uri "\($v)"')
+          CONTAINER_NAME="${{ vars.CONTAINER_NAME }}"
+          PORTAINER_URL="${{ vars.PORTAINER_URL }}"
+          ENDPOINT_IDS_RAW="${{ vars.PORTAINER_ENDPOINT_IDS }}"
+
+          REDIS_ADDR="${{ vars.REDIS_ADDR }}"
+          REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}"
+          REDIS_DB="${{ vars.REDIS_DB }}"
+          [ -z "$REDIS_DB" ] && REDIS_DB="3"
+          # Redis 走 docker DNS 默认 redis:6379;如果运维放 host 上自己填 host.docker.internal:6379
+          [ -z "$REDIS_ADDR" ] && REDIS_ADDR="redis:6379"
+
+          if [ -z "$ENDPOINT_IDS_RAW" ]; then
+            echo "ERROR: vars.PORTAINER_ENDPOINT_IDS 未配置 — 至少要给一个 endpoint id"
+            exit 1
+          fi
+          if [ -z "$CONTAINER_NAME" ]; then
+            CONTAINER_NAME="docker-host-master"
+            echo "vars.CONTAINER_NAME 未设,用默认 $CONTAINER_NAME"
+          fi
+
+          # 解析逗号分隔的 endpoint 列表
+          IFS=',' read -ra ENDPOINT_IDS <<< "$ENDPOINT_IDS_RAW"
+
+          GLOBAL_FAIL=0
+          SUCCEEDED=()
+          FAILED=()
+
+          deploy_to_endpoint() {
+            local endpoint_id=$1
+            local base="${PORTAINER_URL}/endpoints/${endpoint_id}/docker"
+            local old_name="${CONTAINER_NAME}-old-${GITHUB_RUN_ID}"
+
+            echo ""
+            echo "================================================================"
+            echo "  Endpoint: ${endpoint_id}   →   $base"
+            echo "================================================================"
+
+            local api_curl=(curl -fsS --retry 3 --retry-delay 2 -H "X-API-Key: ${{ secrets.PORTAINER_ACCESS_TOKEN }}")
+
+            api() {
+              local method=$1 path=$2; shift 2
+              "${api_curl[@]}" -X "$method" "$@" "${base}${path}"
+            }
+            container_id_by_name() {
+              local name=$1
+              api GET "/containers/json?all=true" \
+                | jq -r --arg n "/$name" '.[] | select(.Names[] == $n) | .Id' | head -1
+            }
+            rollback() {
+              local old_renamed=$1 new_id=${2:-}
+              echo "  [endpoint $endpoint_id] ROLLBACK:把 $old_renamed 改回 $CONTAINER_NAME 并启动"
+              if [ -n "$new_id" ]; then
+                api POST "/containers/$new_id/stop" || true
+                api DELETE "/containers/$new_id?force=true" || true
+              fi
+              local old_id
+              old_id=$(container_id_by_name "$old_renamed" || true)
+              if [ -z "$old_id" ]; then
+                echo "  [endpoint $endpoint_id] 备份 $old_renamed 不见了,ROLLBACK 失败"
+                return 1
+              fi
+              api POST "/containers/$old_id/rename?name=$CONTAINER_NAME" || true
+              api POST "/containers/$old_id/start" || true
+              echo "  [endpoint $endpoint_id] ROLLBACK 完成"
+            }
+
+            echo "  [endpoint $endpoint_id] 清理残留 ${CONTAINER_NAME}-old-*"
+            local stale
+            stale=$(api GET "/containers/json?all=true" \
+              | jq -r --arg p "/${CONTAINER_NAME}-old-" '.[] | select(.Names[] | startswith($p)) | .Id') || true
+            for sid in $stale; do api DELETE "/containers/$sid?force=true" || true; done
+
+            echo "  [endpoint $endpoint_id] Step 1/5: pull $IMAGE_TAG"
+            local pull_body
+            pull_body=$(curl -fsS --retry 3 --retry-delay 2 -X POST \
+              -H "X-API-Key: ${{ secrets.PORTAINER_ACCESS_TOKEN }}" \
+              -H "X-Registry-Auth: ${{ secrets.X_REGISTRY_AUTH }}" \
+              "${base}/images/create?fromImage=${IMAGE_NAME_ENC}") || {
+              echo "  [endpoint $endpoint_id] ERROR: pull HTTP 失败,老容器没动"
+              return 1
+            }
+            if echo "$pull_body" | jq -se 'map(select(.errorDetail != null)) | length > 0' >/dev/null 2>&1; then
+              echo "  [endpoint $endpoint_id] ERROR: pull 报错,老容器没动"
+              echo "$pull_body" | tail -c 1000
+              return 1
+            fi
+
+            echo "  [endpoint $endpoint_id] Step 2/5: inspect 验证镜像"
+            local insp_http
+            insp_http=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "X-API-Key: ${{ secrets.PORTAINER_ACCESS_TOKEN }}" \
+              "${base}/images/${IMAGE_NAME_ENC}/json")
+            [ "$insp_http" = "200" ] || { echo "  [endpoint $endpoint_id] ERROR: inspect HTTP $insp_http"; return 1; }
+
+            echo "  [endpoint $endpoint_id] Step 3/5: 备份老容器 → $old_name"
+            local old_id have_old
+            old_id=$(container_id_by_name "$CONTAINER_NAME" || true)
+            have_old=""
+            if [ -n "$old_id" ]; then
+              have_old=1
+              api POST "/containers/$old_id/stop" || echo "  stop 非 2xx (可能已停)"
+              api POST "/containers/$old_id/rename?name=$old_name" || {
+                echo "  [endpoint $endpoint_id] ERROR: 重命名老容器失败"
+                return 1
+              }
+            else
+              echo "  [endpoint $endpoint_id] 首次部署 (无老容器)"
+            fi
+
+            echo "  [endpoint $endpoint_id] Step 4/5: create + start 新容器"
+            # 关键:
+            # - Binds: docker.sock + /etc/hosts (host bind, 必须) + named volume (内部状态)
+            # - NetworkMode: janyee_net  (只指定网络)
+            # - NetworkingConfig.EndpointsConfig.janyee_net 是空对象 — 不写 IPAMConfig,
+            #   让 docker IPAM 自动分配 IP,绝不绑定具体 IP
+            # - CapAdd: DAC_OVERRIDE 才能写宿主 /etc/hosts
+            # - PortBindings: 8090:8090
+            local create_resp
+            create_resp=$(curl -s -X POST \
+              -H "X-API-Key: ${{ secrets.PORTAINER_ACCESS_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "Image": "'"$IMAGE_TAG"'",
+                "Hostname": "'"$CONTAINER_NAME"'",
+                "Env": [
+                  "REDIS_ADDR='"$REDIS_ADDR"'",
+                  "REDIS_PASSWORD='"$REDIS_PASSWORD"'",
+                  "REDIS_DB='"$REDIS_DB"'"
+                ],
+                "Labels": {
+                  "environment": "production",
+                  "version": "'"$GITHUB_REF_NAME"'",
+                  "app": "'"$CONTAINER_NAME"'"
+                },
+                "ExposedPorts": { "8090/tcp": {} },
+                "HostConfig": {
+                  "Binds": [
+                    "/var/run/docker.sock:/var/run/docker.sock:rw",
+                    "/etc/hosts:/etc/hosts:rw",
+                    "docker-host-master-data:/var/lib/docker-host-master"
+                  ],
+                  "NetworkMode": "janyee_net",
+                  "PortBindings": { "8090/tcp": [{ "HostPort": "8090" }] },
+                  "RestartPolicy": { "Name": "unless-stopped" },
+                  "CapAdd": ["DAC_OVERRIDE"],
+                  "Privileged": false,
+                  "AutoRemove": false
+                },
+                "NetworkingConfig": {
+                  "EndpointsConfig": {
+                    "janyee_net": {}
+                  }
+                }
+              }' \
+              "${base}/containers/create?name=${CONTAINER_NAME}")
+
+            local new_id
+            new_id=$(echo "$create_resp" | jq -r '.Id // empty')
+            if [ -z "$new_id" ]; then
+              echo "  [endpoint $endpoint_id] ERROR: create 失败: $create_resp"
+              [ -n "$have_old" ] && rollback "$old_name" "" || true
+              return 1
+            fi
+            if ! api POST "/containers/$new_id/start"; then
+              echo "  [endpoint $endpoint_id] ERROR: start 失败"
+              [ -n "$have_old" ] && rollback "$old_name" "$new_id" || true
+              return 1
+            fi
+
+            echo "  [endpoint $endpoint_id] Step 5/5: 健康检查 State.Running"
+            sleep 8
+            local state
+            state=$(api GET "/containers/$new_id/json" | jq -r '.State.Running')
+            if [ "$state" != "true" ]; then
+              echo "  [endpoint $endpoint_id] ERROR: State.Running=$state,启动失败,log:"
+              api GET "/containers/$new_id/logs?stdout=true&stderr=true&tail=100" || true
+              [ -n "$have_old" ] && rollback "$old_name" "$new_id" || true
+              return 1
+            fi
+
+            echo "  [endpoint $endpoint_id] ✓ 部署成功"
+            if [ -n "$have_old" ]; then
+              local old_bak_id
+              old_bak_id=$(container_id_by_name "$old_name" || true)
+              [ -n "$old_bak_id" ] && api DELETE "/containers/$old_bak_id?force=true" || true
+            fi
+            return 0
+          }
+
+          for raw_id in "${ENDPOINT_IDS[@]}"; do
+            # trim whitespace
+            ENDPOINT_ID=$(echo "$raw_id" | xargs)
+            [ -z "$ENDPOINT_ID" ] && continue
+
+            if deploy_to_endpoint "$ENDPOINT_ID"; then
+              SUCCEEDED+=("$ENDPOINT_ID")
+            else
+              FAILED+=("$ENDPOINT_ID")
+              GLOBAL_FAIL=1
+            fi
+          done
+
+          echo ""
+          echo "================================================================"
+          echo "  部署汇总"
+          echo "================================================================"
+          echo "  ✓ 成功 (${#SUCCEEDED[@]}): ${SUCCEEDED[*]:-(none)}"
+          echo "  ✗ 失败 (${#FAILED[@]}): ${FAILED[*]:-(none)}"
+
+          if [ $GLOBAL_FAIL -ne 0 ]; then
+            echo ""
+            echo "至少一个 endpoint 部署失败 → job FAILED"
+            exit 1
+          fi
+          echo ""
+          echo "所有 endpoint 部署成功 ✓"
