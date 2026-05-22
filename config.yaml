@@ -1,0 +1,8 @@
+server:
+  port: 8090
+  name: docker-host-master
+consul:
+  address: ${CONSUL_ADDRESS:consul.janyee.com}
+  token: ${CONSUL_TOKEN:}
+  config_path: ${CONSUL_CONFIG_PATH:docker_host_master/config}
+  enabled: true

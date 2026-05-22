@@ -1,0 +1,44 @@
+name: Build and Push on Tag
+
+# docker-host-master 每台主机一个实例,GitHub Actions 只负责构建+推 Harbor。
+# 实际部署每台 host 自己跑(README 里给 docker run 命令)。
+# 后续如果接 Portainer per-host endpoint,可以加分支按 hostname 派发。
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Login to Harbor
+        run: echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ vars.HARBOR_URL }} -u "${{ secrets.HARBOR_USERNAME }}" --password-stdin
+
+      - name: Build and Push Docker Image
+        run: |
+          IMAGE_TAG="${{ vars.HARBOR_URL }}/${{ vars.IMAGE_NAME }}:${{ github.ref_name }}"
+          echo "Building $IMAGE_TAG"
+          docker build -t "$IMAGE_TAG" .
+          docker push "$IMAGE_TAG"
+
+      - name: Sign Container Image
+        env:
+          COSIGN_PASSWORD: "${{ secrets.COSIGN_PASSWORD }}"
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          IMAGE_TAG="${{ vars.HARBOR_URL }}/${{ vars.IMAGE_NAME }}:${{ github.ref_name }}"
+          echo "${{ secrets.COSIGN_PRIVATE_KEY }}" > cosign.key
+          chmod 600 cosign.key
+          cosign sign --key cosign.key "$IMAGE_TAG"
+          rm -f cosign.key

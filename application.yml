@@ -1,0 +1,44 @@
+# docker-host-master 的 consul 配置模板。
+# 部署时上传到 consul KV 的 ${CONSUL_CONFIG_PATH}(默认 docker_host_master/config)。
+#
+# 每台主机部署一个实例时,如果配置可以全集群共享(都连同一个 postgres + 同一个
+# authing IdP),那 KV 里放一份就够。Token store 是按 host 分的话需要每台有独立
+# 数据库(用 hostname 区分 schema 或表前缀)。最简单方案:全集群共享一个 DB,
+# AccessToken 表加 hostname 列做 scope。
+
+server:
+  port: ${SERVER_PORT:8090}
+  name: ${SERVICE_NAME:docker-host-master}
+
+# Docker daemon 连接 — 默认走本机 unix socket(容器内 bind mount 进来)
+docker:
+  endpoint: ${DOCKER_ENDPOINT:unix:///var/run/docker.sock}
+  # 操作超时(秒)
+  timeout_seconds: ${DOCKER_TIMEOUT_SEC:30}
+
+# /etc/hosts 路径(容器内 bind mount 自宿主机 /etc/hosts)
+hosts:
+  file: ${HOSTS_FILE:/etc/hosts}
+  # managed 块标识 — 服务只动这两个 sentinel 之间的内容,不碰 user 自己写的条目
+  begin_marker: "# BEGIN docker-host-master (DO NOT EDIT)"
+  end_marker: "# END docker-host-master"
+  # 同步策略
+  reconcile_interval_sec: ${RECONCILE_INTERVAL_SEC:300}
+
+# Token store 数据库(access_token 持久化)
+database:
+  host: ${DB_HOST:172.17.0.1}
+  port: ${DB_PORT:5432}
+  user: ${DB_USER:postgres}
+  password: ${DB_PASSWORD:}
+  dbname: ${DB_NAME:docker_host_master}
+  sslmode: ${DB_SSLMODE:disable}
+
+# Authing 配置 — /admin/* 路由走 authing JWKS 验签 admin token
+# OAuth issuer 留空时,/admin/* 路由会拒绝所有请求(开发模式可设特殊值)
+oauth:
+  issuer: ${OAUTH_ISSUER:https://auth.janyee.com}
+
+# 审计 log 文件路径(external 调用必记)
+audit:
+  log_file: ${AUDIT_LOG:/var/log/docker-host-master/audit.log}

@@ -1,0 +1,6 @@
+/docker-host-master
+*.bak
+.DS_Store
+.idea/
+.vscode/
+*.log
