@@ -23,8 +23,10 @@ ENV TZ=Asia/Shanghai
 COPY --from=builder /app/docker-host-master .
 # 配置全走 env vars,镜像里不带任何配置文件
 
-# 创建 audit log 目录
-RUN mkdir -p /var/log/docker-host-master
+# token store JSON 文件 + audit log 目录
+RUN mkdir -p /var/lib/docker-host-master /var/log/docker-host-master
+
+# (audit log + token store 目录在上面已经一并 mkdir)
 
 EXPOSE 8090
 

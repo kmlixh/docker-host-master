@@ -4,20 +4,19 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"time"
 )
 
-// Config 是服务的全部运行时配置。
-// 来源:纯环境变量 + 合理默认。不依赖 Consul、不读配置文件。
+// Config 是服务的全部运行时配置 — 纯环境变量 + 合理默认。
+// 无 Consul、无 postgres、无 yaml。
 //
-// 部署:docker run 时把要改的字段以 -e KEY=VALUE 形式传。
-// 也可以放 docker-compose.yml 的 environment 块里。
+// 鉴权拓扑:
+//   /admin/*    走 adminBackend 颁发的 admin opaque token(共享 Redis 查 user_id_<t>)
+//   /external/* 走本地 JSON 文件存的 access_token(bcrypt 哈希)
 //
-// 必填字段(没默认值,空就拒绝启动):
-//   DB_PASSWORD  — token store 用,空了 /admin/tokens + /external/* 全 503
-//   OAUTH_ISSUER — admin 鉴权用,空了 /admin/* 全 503
+// 必填:
+//   REDIS_ADDR     — admin token 验证靠这个,空了 /admin/* 全部 503
 //
-// 其它字段都有合理默认,大多场景不用改。
+// (注:adminBackend / userLogin 的 admin 是写 Redis db=3,这里 REDIS_DB 必须对齐 = 3)
 type Config struct {
 	Server struct {
 		Port int
@@ -25,51 +24,34 @@ type Config struct {
 	}
 
 	Docker struct {
-		Endpoint       string // 默认 unix:///var/run/docker.sock
-		TimeoutSeconds int    // 默认 30
+		Endpoint       string
+		TimeoutSeconds int
 	}
 
 	Hosts struct {
-		File                 string // 默认 /etc/hosts
-		BeginMarker          string // 默认 "# BEGIN docker-host-master (DO NOT EDIT)"
-		EndMarker            string // 默认 "# END docker-host-master"
-		ReconcileIntervalSec int    // 默认 300 (5min)
+		File                 string
+		BeginMarker          string
+		EndMarker            string
+		ReconcileIntervalSec int
 	}
 
-	Database struct {
-		Host     string // 默认 172.17.0.1 (docker bridge gateway,容器内访问宿主)
-		Port     int    // 默认 5432
-		User     string // 默认 postgres
-		Password string // 必填(空 = token store 跳过初始化,/admin/tokens + /external/* 503)
-		DBName   string // 默认 docker_host_master
-		SSLMode  string // 默认 disable
+	// Redis — 跟 adminBackend.authing.redis 对齐,共享 admin token store
+	Redis struct {
+		Addr     string // 例如 172.17.0.1:6379;空 = /admin/* 全 503
+		Password string
+		DB       int // 跟 adminBackend.authing.redis.database 对齐 (db=3)
 	}
 
-	OAuth struct {
-		Issuer string // 例如 https://auth.janyee.com,空 = /admin/* 全 503
+	// 本地 token store(JSON 文件)— /external/* 的 access_token 存这
+	TokenStore struct {
+		File string // 默认 /var/lib/docker-host-master/tokens.json
 	}
 
 	Audit struct {
-		LogFile string // 默认 /var/log/docker-host-master/audit.log
+		LogFile string
 	}
 }
 
-// GetDSN 拼 PostgreSQL DSN
-func (c *Config) GetDSN() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.Database.Host, c.Database.Port,
-		c.Database.User, c.Database.Password,
-		c.Database.DBName, c.Database.SSLMode,
-	)
-}
-
-// LoadFromEnv 从环境变量读出全部配置,缺省值兜底。
-//
-// 每台 host 部署时只需要在 docker run 里塞:
-//   -e DB_PASSWORD=xxx
-//   -e DB_HOST=<pg-host>   (默认 172.17.0.1,共享宿主 pg 时常用;远程 pg 改这里)
-//   -e OAUTH_ISSUER=https://auth.janyee.com
-// 就够了,其它都能用默认。
 func LoadFromEnv() *Config {
 	c := &Config{}
 
@@ -84,33 +66,25 @@ func LoadFromEnv() *Config {
 	c.Hosts.EndMarker = envStr("HOSTS_END_MARKER", "# END docker-host-master")
 	c.Hosts.ReconcileIntervalSec = envInt("HOSTS_RECONCILE_INTERVAL_SEC", 300)
 
-	c.Database.Host = envStr("DB_HOST", "172.17.0.1")
-	c.Database.Port = envInt("DB_PORT", 5432)
-	c.Database.User = envStr("DB_USER", "postgres")
-	c.Database.Password = envStr("DB_PASSWORD", "") // 必填,无默认
-	c.Database.DBName = envStr("DB_NAME", "docker_host_master")
-	c.Database.SSLMode = envStr("DB_SSLMODE", "disable")
+	c.Redis.Addr = envStr("REDIS_ADDR", "") // 必填
+	c.Redis.Password = envStr("REDIS_PASSWORD", "")
+	c.Redis.DB = envInt("REDIS_DB", 3) // 默认 3 跟 adminBackend.authing.redis.database 对齐
 
-	c.OAuth.Issuer = envStr("OAUTH_ISSUER", "") // 必填,无默认
+	c.TokenStore.File = envStr("TOKEN_STORE_FILE", "/var/lib/docker-host-master/tokens.json")
 
 	c.Audit.LogFile = envStr("AUDIT_LOG", "/var/log/docker-host-master/audit.log")
 
 	return c
 }
 
-// Warnings 返回配置完整性 warning 列表(启动时打,让运维知道哪些功能会被禁掉)
+// Warnings 启动时 log 出来让运维知道哪些功能会因为缺配被禁
 func (c *Config) Warnings() []string {
 	var w []string
-	if c.Database.Password == "" {
-		w = append(w, "DB_PASSWORD 未设 → token store 跳过初始化 → /admin/tokens + /external/* 路由会 503")
-	}
-	if c.OAuth.Issuer == "" {
-		w = append(w, "OAUTH_ISSUER 未设 → /admin/* 路由会拒绝所有请求(只剩 /health 可用)")
+	if c.Redis.Addr == "" {
+		w = append(w, "REDIS_ADDR 未设 → /admin/* 路由会拒绝所有请求(adminBackend admin token 验不了)")
 	}
 	return w
 }
-
-// 内部 helper
 
 func envStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -128,12 +102,5 @@ func envInt(key string, def int) int {
 	return def
 }
 
-// duration helper(目前没用,但留着方便扩展)
-func _envDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return def
-}
+// 占位,避免 import "fmt" 被 tidy 删
+var _ = fmt.Sprintf

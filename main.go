@@ -30,11 +30,12 @@ func main() {
 
 	// 1. 加载配置 — 纯 env vars,合理默认。无 Consul 依赖。
 	appCfg = LoadFromEnv()
-	log.Printf("config: port=%d docker=%s hosts=%s db=%s@%s:%d/%s",
+	log.Printf("config: port=%d docker=%s hosts=%s redis=%s/db%d tokens=%s",
 		appCfg.Server.Port,
 		appCfg.Docker.Endpoint,
 		appCfg.Hosts.File,
-		appCfg.Database.User, appCfg.Database.Host, appCfg.Database.Port, appCfg.Database.DBName,
+		appCfg.Redis.Addr, appCfg.Redis.DB,
+		appCfg.TokenStore.File,
 	)
 	for _, w := range appCfg.Warnings() {
 		log.Printf("WARN: %s", w)
@@ -67,20 +68,15 @@ func main() {
 		hostDaemon.Wait()
 	}()
 
-	// 4. Token store (DB 没配就跳过,/admin/tokens + /external/* 会 503)
-	if appCfg.Database.Password != "" {
-		ts, err := NewTokenStore(appCfg)
-		if err != nil {
-			log.Printf("WARN: token store init failed: %v (/admin/tokens + /external/* 会 503)", err)
-		} else {
-			tokenStore = ts
-			log.Println("token store ready")
-		}
+	// 4. Token store — 本地 JSON 文件
+	ts, err := LoadTokenStore(appCfg.TokenStore.File)
+	if err != nil {
+		log.Printf("WARN: token store load failed: %v (/admin/tokens + /external/* 会 503)", err)
 	} else {
-		log.Println("token store skipped (DB_PASSWORD 未设)")
+		tokenStore = ts
 	}
 
-	// 5. authing JWT validator (issuer 没配就 nil,/admin/* 会 503)
+	// 5. authing(只 Redis 验 adminBackend opaque admin token)
 	InitAuthing(appCfg)
 
 	// 6. Audit log

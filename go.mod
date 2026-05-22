@@ -7,8 +7,6 @@ require (
 	github.com/gofiber/fiber/v2 v2.52.13
 	github.com/kmlixh/authing v0.3.2-0.20260518141552-9bd89b052c1a
 	golang.org/x/crypto v0.52.0
-	gorm.io/driver/postgres v1.6.0
-	gorm.io/gorm v1.31.1
 )
 
 require (
@@ -60,5 +58,7 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
+	gorm.io/driver/postgres v1.6.0 // indirect
+	gorm.io/gorm v1.31.1 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
