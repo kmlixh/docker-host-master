@@ -242,29 +242,47 @@ func stripPrefix(s, prefix string) (string, bool) {
 	return "", false
 }
 
-// atomicWrite 优先 temp+rename,失败回退到原地 truncate+write(bind mount 场景)
+// atomicWrite 优先 temp+rename,失败回退到原地 truncate+write(bind mount 场景)。
+//
+// 一旦在当前进程内检测过 rename 不支持(典型场景:/etc/hosts 是 bind mount 单文件,
+// inode 被宿主锁定 → rename 报 EBUSY),后续直接走 in-place 不再尝试 — 避免每次
+// reconcile/docker event 都刷一条同样的 WARN(那玩意儿一小时几十条没用的噪音)。
+//
+// renameBroken 是包级 bool,无 atomic 也安全:atomicWrite 永远在 HostsManager.mu
+// 持锁下调用 (Append/Remove/Reconcile 等公开方法都先 m.mu.Lock())。
+var (
+	renameBroken     bool
+	renameBrokenOnce sync.Once
+)
+
 func atomicWrite(path string, data []byte, currentFile *os.File) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".hosts.tmp.*")
-	if err == nil {
-		_, werr := tmp.Write(data)
-		tmp.Close()
-		if werr == nil {
-			if rerr := os.Rename(tmp.Name(), path); rerr == nil {
-				return nil
-			} else {
-				log.Printf("rename failed (likely bind mount): %v — fall back to in-place", rerr)
+	if !renameBroken {
+		dir := filepath.Dir(path)
+		tmp, err := os.CreateTemp(dir, ".hosts.tmp.*")
+		if err == nil {
+			_, werr := tmp.Write(data)
+			tmp.Close()
+			if werr == nil {
+				if rerr := os.Rename(tmp.Name(), path); rerr == nil {
+					return nil // 走得通,正常路径
+				} else {
+					// 第一次失败:记一次 INFO 然后永久切 in-place 模式
+					renameBrokenOnce.Do(func() {
+						log.Printf("hosts: temp+rename 不可用 (%v) — 通常因为 %s 是 bind mount 单文件,inode 锁定;切到 in-place truncate+write 模式,后续静默", rerr, path)
+					})
+					renameBroken = true
+				}
 			}
+			os.Remove(tmp.Name())
 		}
-		os.Remove(tmp.Name())
 	}
-	// fallback:原地 truncate + write,currentFile 已 flock
+	// fallback / 永久路径:原地 truncate + write,currentFile 已 flock
 	if _, err := currentFile.Seek(0, 0); err != nil {
 		return err
 	}
 	if err := currentFile.Truncate(0); err != nil {
 		return err
 	}
-	_, err = currentFile.Write(data)
+	_, err := currentFile.Write(data)
 	return err
 }
