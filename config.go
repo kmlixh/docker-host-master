@@ -3,187 +3,137 @@ package main
 import (
 	"fmt"
 	"os"
-
-	"github.com/kmlixh/consulTool"
-	"github.com/kmlixh/dollarYaml"
+	"strconv"
+	"time"
 )
 
-// LocalConfig 本地 config.yaml(只有 consul 连接信息,启动时读)
-type LocalConfig struct {
-	Server struct {
-		Port int    `yaml:"port"`
-		Name string `yaml:"name"`
-	} `yaml:"server"`
-
-	Consul struct {
-		Address    string `yaml:"address"`
-		Token      string `yaml:"token"`
-		ConfigPath string `yaml:"config_path"`
-		Enabled    bool   `yaml:"enabled"`
-	} `yaml:"consul"`
-}
-
-// Config 从 consul KV 拉取的应用配置(application.yml)
+// Config 是服务的全部运行时配置。
+// 来源:纯环境变量 + 合理默认。不依赖 Consul、不读配置文件。
+//
+// 部署:docker run 时把要改的字段以 -e KEY=VALUE 形式传。
+// 也可以放 docker-compose.yml 的 environment 块里。
+//
+// 必填字段(没默认值,空就拒绝启动):
+//   DB_PASSWORD  — token store 用,空了 /admin/tokens + /external/* 全 503
+//   OAUTH_ISSUER — admin 鉴权用,空了 /admin/* 全 503
+//
+// 其它字段都有合理默认,大多场景不用改。
 type Config struct {
 	Server struct {
-		Port int    `yaml:"port"`
-		Name string `yaml:"name"`
-	} `yaml:"server"`
+		Port int
+		Name string
+	}
 
 	Docker struct {
-		// unix:///var/run/docker.sock 或 tcp://host:port
-		Endpoint       string `yaml:"endpoint"`
-		TimeoutSeconds int    `yaml:"timeout_seconds"`
-	} `yaml:"docker"`
+		Endpoint       string // 默认 unix:///var/run/docker.sock
+		TimeoutSeconds int    // 默认 30
+	}
 
 	Hosts struct {
-		File                 string `yaml:"file"`
-		BeginMarker          string `yaml:"begin_marker"`
-		EndMarker            string `yaml:"end_marker"`
-		ReconcileIntervalSec int    `yaml:"reconcile_interval_sec"`
-	} `yaml:"hosts"`
+		File                 string // 默认 /etc/hosts
+		BeginMarker          string // 默认 "# BEGIN docker-host-master (DO NOT EDIT)"
+		EndMarker            string // 默认 "# END docker-host-master"
+		ReconcileIntervalSec int    // 默认 300 (5min)
+	}
 
 	Database struct {
-		Host     string `yaml:"host"`
-		Port     int    `yaml:"port"`
-		User     string `yaml:"user"`
-		Password string `yaml:"password"`
-		DBName   string `yaml:"dbname"`
-		SSLMode  string `yaml:"sslmode"`
-	} `yaml:"database"`
+		Host     string // 默认 172.17.0.1 (docker bridge gateway,容器内访问宿主)
+		Port     int    // 默认 5432
+		User     string // 默认 postgres
+		Password string // 必填(空 = token store 跳过初始化,/admin/tokens + /external/* 503)
+		DBName   string // 默认 docker_host_master
+		SSLMode  string // 默认 disable
+	}
 
 	OAuth struct {
-		// authing JWKS issuer URL,例如 https://auth.janyee.com
-		Issuer string `yaml:"issuer"`
-	} `yaml:"oauth"`
+		Issuer string // 例如 https://auth.janyee.com,空 = /admin/* 全 503
+	}
 
 	Audit struct {
-		LogFile string `yaml:"log_file"`
-	} `yaml:"audit"`
+		LogFile string // 默认 /var/log/docker-host-master/audit.log
+	}
 }
 
 // GetDSN 拼 PostgreSQL DSN
 func (c *Config) GetDSN() string {
-	ssl := c.Database.SSLMode
-	if ssl == "" {
-		ssl = "disable"
-	}
 	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		c.Database.Host, c.Database.Port,
 		c.Database.User, c.Database.Password,
-		c.Database.DBName, ssl,
+		c.Database.DBName, c.Database.SSLMode,
 	)
 }
 
-// LoadLocalConfig 读 config.yaml + env 变量覆盖
-func LoadLocalConfig(path string) (*LocalConfig, error) {
-	var cfg LocalConfig
-	profile := dollarYaml.New()
-	if err := profile.ReadFromPath(path); err != nil {
-		return nil, fmt.Errorf("read local config: %w", err)
-	}
-	if err := profile.UnmarshalTo(&cfg); err != nil {
-		return nil, fmt.Errorf("parse local config: %w", err)
-	}
-	// 显式 env 覆盖(dollarYaml 已经处理 ${VAR:default} 形式,这里给 CONSUL_* 兜底)
-	if v := os.Getenv("CONSUL_ADDRESS"); v != "" {
-		cfg.Consul.Address = v
-	}
-	if v := os.Getenv("CONSUL_TOKEN"); v != "" {
-		cfg.Consul.Token = v
-	}
-	if v := os.Getenv("CONSUL_CONFIG_PATH"); v != "" {
-		cfg.Consul.ConfigPath = v
-	}
-	return &cfg, nil
+// LoadFromEnv 从环境变量读出全部配置,缺省值兜底。
+//
+// 每台 host 部署时只需要在 docker run 里塞:
+//   -e DB_PASSWORD=xxx
+//   -e DB_HOST=<pg-host>   (默认 172.17.0.1,共享宿主 pg 时常用;远程 pg 改这里)
+//   -e OAUTH_ISSUER=https://auth.janyee.com
+// 就够了,其它都能用默认。
+func LoadFromEnv() *Config {
+	c := &Config{}
+
+	c.Server.Port = envInt("SERVER_PORT", 8090)
+	c.Server.Name = envStr("SERVICE_NAME", "docker-host-master")
+
+	c.Docker.Endpoint = envStr("DOCKER_ENDPOINT", "unix:///var/run/docker.sock")
+	c.Docker.TimeoutSeconds = envInt("DOCKER_TIMEOUT_SEC", 30)
+
+	c.Hosts.File = envStr("HOSTS_FILE", "/etc/hosts")
+	c.Hosts.BeginMarker = envStr("HOSTS_BEGIN_MARKER", "# BEGIN docker-host-master (DO NOT EDIT)")
+	c.Hosts.EndMarker = envStr("HOSTS_END_MARKER", "# END docker-host-master")
+	c.Hosts.ReconcileIntervalSec = envInt("HOSTS_RECONCILE_INTERVAL_SEC", 300)
+
+	c.Database.Host = envStr("DB_HOST", "172.17.0.1")
+	c.Database.Port = envInt("DB_PORT", 5432)
+	c.Database.User = envStr("DB_USER", "postgres")
+	c.Database.Password = envStr("DB_PASSWORD", "") // 必填,无默认
+	c.Database.DBName = envStr("DB_NAME", "docker_host_master")
+	c.Database.SSLMode = envStr("DB_SSLMODE", "disable")
+
+	c.OAuth.Issuer = envStr("OAUTH_ISSUER", "") // 必填,无默认
+
+	c.Audit.LogFile = envStr("AUDIT_LOG", "/var/log/docker-host-master/audit.log")
+
+	return c
 }
 
-// consul 注册 + 配置拉取
-
-var serviceRegistrant *consulTool.ServiceRegistrant
-
-type ConsulTool struct {
-	config     *consulTool.Config
-	agent      *consulTool.Agent
-	configPath string
+// Warnings 返回配置完整性 warning 列表(启动时打,让运维知道哪些功能会被禁掉)
+func (c *Config) Warnings() []string {
+	var w []string
+	if c.Database.Password == "" {
+		w = append(w, "DB_PASSWORD 未设 → token store 跳过初始化 → /admin/tokens + /external/* 路由会 503")
+	}
+	if c.OAuth.Issuer == "" {
+		w = append(w, "OAUTH_ISSUER 未设 → /admin/* 路由会拒绝所有请求(只剩 /health 可用)")
+	}
+	return w
 }
 
-func NewConsulTool(address, token, configPath string) (*ConsulTool, error) {
-	cfg := consulTool.NewConfigWithAddress(address)
-	if token != "" {
-		cfg.SetToken(token)
+// 内部 helper
+
+func envStr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return &ConsulTool{
-		config:     cfg,
-		agent:      consulTool.NewAgent(cfg),
-		configPath: configPath,
-	}, nil
+	return def
 }
 
-func (c *ConsulTool) LoadConfig() (*Config, error) {
-	kv, err := c.agent.GetKV(c.configPath)
-	if err != nil {
-		return nil, fmt.Errorf("get KV %q: %w", c.configPath, err)
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
-	if kv == nil || kv.Value == nil {
-		return nil, fmt.Errorf("consul KV %q empty", c.configPath)
-	}
-	profile := dollarYaml.New()
-	if err := profile.Read(kv.Value); err != nil {
-		return nil, fmt.Errorf("parse KV yaml: %w", err)
-	}
-	var cfg Config
-	if err := profile.UnmarshalTo(&cfg); err != nil {
-		return nil, fmt.Errorf("unmarshal Config: %w", err)
-	}
-	return &cfg, nil
+	return def
 }
 
-// RegisterService 把自己注册到 consul。
-// 每台主机一个实例,用 hostname 区分 service ID + tag,让 gateway / 服务发现知道
-// 当前 instance 对应哪台 host。
-func RegisterService(local *LocalConfig, address, token string) error {
-	if !local.Consul.Enabled {
-		return nil
+// duration helper(目前没用,但留着方便扩展)
+func _envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
-	cfg := consulTool.NewConfigWithAddress(address)
-	if token != "" {
-		cfg.SetToken(token)
-	}
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
-	}
-	serviceName := local.Server.Name
-	if serviceName == "" {
-		serviceName = "docker-host-master"
-	}
-	// service ID 带 hostname,多台主机不会撞
-	serviceID := fmt.Sprintf("%s-%s-%d", serviceName, hostname, local.Server.Port)
-	builder := consulTool.NewServiceRegistrantBuilder(cfg)
-	r, err := builder.
-		WithID(serviceID).
-		WithName(serviceName).
-		WithPort(local.Server.Port).
-		WithTags([]string{"host", "docker", "host:" + hostname}).
-		WithHealthCheckPath("/health").
-		WithHttpSchema("http").
-		WithInterval("10s").
-		WithTimeout("5s").
-		Build()
-	if err != nil {
-		return fmt.Errorf("build registrant: %w", err)
-	}
-	if err := r.RegisterService(); err != nil {
-		return fmt.Errorf("register service: %w", err)
-	}
-	serviceRegistrant = r
-	return nil
-}
-
-func DeregisterService() error {
-	if serviceRegistrant == nil {
-		return nil
-	}
-	return serviceRegistrant.DeRegisterService()
+	return def
 }

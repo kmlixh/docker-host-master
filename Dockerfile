@@ -21,7 +21,7 @@ RUN apk add --no-cache ca-certificates tzdata
 ENV TZ=Asia/Shanghai
 
 COPY --from=builder /app/docker-host-master .
-COPY --from=builder /app/config.yaml .
+# 配置全走 env vars,镜像里不带任何配置文件
 
 # 创建 audit log 目录
 RUN mkdir -p /var/log/docker-host-master

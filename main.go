@@ -15,8 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
-// 全局应用配置(consul 加载后填),给各 handler/middleware 用。
-// daemon goroutine 也读它(docker endpoint / hosts file path)
+// 全局,handler/middleware 用
 var (
 	appCfg     *Config
 	dockerCli  *DockerClient
@@ -29,38 +28,26 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("=== docker-host-master starting ===")
 
-	// 1. 加载本地 consul 地址配置
-	local, err := LoadLocalConfig("config.yaml")
-	if err != nil {
-		log.Fatalf("load local config: %v", err)
+	// 1. 加载配置 — 纯 env vars,合理默认。无 Consul 依赖。
+	appCfg = LoadFromEnv()
+	log.Printf("config: port=%d docker=%s hosts=%s db=%s@%s:%d/%s",
+		appCfg.Server.Port,
+		appCfg.Docker.Endpoint,
+		appCfg.Hosts.File,
+		appCfg.Database.User, appCfg.Database.Host, appCfg.Database.Port, appCfg.Database.DBName,
+	)
+	for _, w := range appCfg.Warnings() {
+		log.Printf("WARN: %s", w)
 	}
-	log.Printf("local config: consul=%s path=%s", local.Consul.Address, local.Consul.ConfigPath)
 
-	// 2. 注册到 consul(每台 host 各自实例,service ID 带 hostname)
-	if err := RegisterService(local, local.Consul.Address, local.Consul.Token); err != nil {
-		log.Printf("WARN: consul register failed: %v (服务继续启动)", err)
-	}
-
-	// 3. 拉 application.yml from consul KV
-	ct, err := NewConsulTool(local.Consul.Address, local.Consul.Token, local.Consul.ConfigPath)
+	// 2. Docker client + 验 daemon 可达(失败 warn,daemon goroutine 还会自动重试)
+	cli, err := NewDockerClient(appCfg.Docker.Endpoint, appCfg.Docker.TimeoutSeconds)
 	if err != nil {
-		log.Fatalf("consul tool: %v", err)
+		log.Fatalf("docker client init: %v", err)
 	}
-	cfg, err := ct.LoadConfig()
-	if err != nil {
-		log.Fatalf("load app config from consul: %v", err)
-	}
-	appCfg = cfg
-	log.Printf("app config loaded: docker=%s hosts=%s", cfg.Docker.Endpoint, cfg.Hosts.File)
-
-	// 4. Docker client + /etc/hosts manager + daemon (Phase B)
-	dockerCli, err = NewDockerClient(cfg.Docker.Endpoint, cfg.Docker.TimeoutSeconds)
-	if err != nil {
-		log.Fatalf("docker client: %v", err)
-	}
+	dockerCli = cli
 	defer dockerCli.Close()
 
-	// 验 docker daemon 可达(不行不致命,只 log)
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if ver, perr := dockerCli.Ping(pingCtx); perr != nil {
 		log.Printf("WARN: docker daemon ping failed: %v (daemon goroutine 仍会启动,会自动重试)", perr)
@@ -69,33 +56,38 @@ func main() {
 	}
 	pingCancel()
 
-	hostsMgr = NewHostsManager(cfg.Hosts.File, cfg.Hosts.BeginMarker, cfg.Hosts.EndMarker)
-
-	// 起 daemon goroutine — 事件循环 + 定期 reconcile
+	// 3. /etc/hosts manager + daemon goroutine
+	hostsMgr = NewHostsManager(appCfg.Hosts.File, appCfg.Hosts.BeginMarker, appCfg.Hosts.EndMarker)
 	daemonCtx, daemonCancel := context.WithCancel(context.Background())
-	hostDaemon = NewDaemon(dockerCli, hostsMgr, cfg)
+	hostDaemon = NewDaemon(dockerCli, hostsMgr, appCfg)
 	hostDaemon.Start(daemonCtx)
 	defer func() {
-		log.Println("stopping daemon...")
+		log.Println("stopping daemon goroutine...")
 		daemonCancel()
 		hostDaemon.Wait()
-		log.Println("daemon stopped")
 	}()
 
-	// 4. Token store (Phase C) — 失败致命(没 DB 外部 API 全废,admin token CRUD 也废)
-	tokenStore, err = NewTokenStore(cfg)
-	if err != nil {
-		log.Printf("WARN: token store init failed: %v (/admin/tokens + /external/* 路由会 503)", err)
+	// 4. Token store (DB 没配就跳过,/admin/tokens + /external/* 会 503)
+	if appCfg.Database.Password != "" {
+		ts, err := NewTokenStore(appCfg)
+		if err != nil {
+			log.Printf("WARN: token store init failed: %v (/admin/tokens + /external/* 会 503)", err)
+		} else {
+			tokenStore = ts
+			log.Println("token store ready")
+		}
+	} else {
+		log.Println("token store skipped (DB_PASSWORD 未设)")
 	}
 
-	// 5. Authing JWT validator (Phase C) — 失败 warn,/admin/* 路由会拒绝所有请求
-	InitAuthing(cfg)
+	// 5. authing JWT validator (issuer 没配就 nil,/admin/* 会 503)
+	InitAuthing(appCfg)
 
-	// 6. Audit log (Phase D)
-	InitAuditLog(cfg)
+	// 6. Audit log
+	InitAuditLog(appCfg)
 	defer CloseAuditLog()
 
-	// 5. Fiber HTTP server
+	// 7. Fiber HTTP server
 	app := fiber.New(fiber.Config{
 		ErrorHandler: customErrorHandler,
 	})
@@ -103,14 +95,13 @@ func main() {
 	app.Use(cors.New())
 	app.Use(logger.New())
 
-	// 路由 — Phase A 只挂 /health
 	SetupRouter(app)
 
-	// 6. 信号 + graceful shutdown
+	// 8. 信号 + graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	addr := fmt.Sprintf(":%d", appCfg.Server.Port)
 	go func() {
 		log.Printf("HTTP server listening on %s", addr)
 		if err := app.Listen(addr); err != nil {
@@ -121,19 +112,15 @@ func main() {
 	sig := <-sigCh
 	log.Printf("received signal %s, shutting down...", sig)
 
-	// 优雅关闭
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := app.ShutdownWithContext(ctx); err != nil {
 		log.Printf("server shutdown: %v", err)
 	}
-	if err := DeregisterService(); err != nil {
-		log.Printf("consul deregister: %v", err)
-	}
 	log.Println("=== docker-host-master stopped ===")
 }
 
-// 标准 JSON 错误响应,跟 monorepo 其他服务对齐
+// customErrorHandler 标准 JSON 错误响应
 func customErrorHandler(c *fiber.Ctx, err error) error {
 	code := fiber.StatusInternalServerError
 	if e, ok := err.(*fiber.Error); ok {
